@@ -1493,12 +1493,12 @@ def load_inference_stack() -> tuple[
             "Inference is disabled in configs/inference/inference.yaml."
         )
 
-    _set_reproducibility_seed(config)
+    _set_reproducibility_seed(
+        config["inference"]["reproducibility"]["seed"]
+    )
 
     tokenizer = _load_tokenizer(config)
-
     model = _load_base_model(config)
-
     model = _load_lora_adapter(
         model=model,
         config=config,
