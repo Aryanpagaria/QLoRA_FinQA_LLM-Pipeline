@@ -1,151 +1,126 @@
 """
 Local model provider.
 
-This provider wraps the existing inference engine and exposes it through
-the common BaseProvider interface.
+This provider connects the application layer to the locally loaded
+Qwen2.5-3B-Instruct model with the trained QLoRA adapter.
 
-The local backend uses:
-    - Qwen/Qwen2.5-3B-Instruct
-    - 4-bit quantization
-    - the exported QLoRA adapter
-
-The model is loaded once when LocalProvider is created and reused for
-all subsequent generation requests.
+The provider loads the model once when it is created and reuses that
+model for subsequent requests.
 """
 
 from typing import Any
 
-from src.inference.inference import (
-    GenerationResult,
-    _build_prompt,
-    _load_base_model,
-    _load_inference_config,
-    _load_lora_adapter,
-    _load_tokenizer,
-    _set_reproducibility_seed,
-    generate_response,
-)
+import torch
 
-from .base import BaseProvider
+from src.inference.inference import (
+    InferenceConfig,
+    _build_prompt,
+    generate_response,
+    load_inference_stack,
+)
+from src.providers.base import BaseProvider
 
 
 class LocalProvider(BaseProvider):
     """
-    Provider for the locally hosted Qwen + QLoRA model.
+    Provider for the locally fine-tuned Qwen model.
 
-    The model and tokenizer are loaded once during initialization.
-    Each call to generate() reuses the same loaded model.
+    The model, tokenizer, and inference configuration are loaded once
+    during initialization. Each call to generate() then reuses them.
     """
 
     def __init__(self) -> None:
         """
-        Initialize the local provider.
+        Initialize the local inference provider.
 
-        This loads:
-            1. Inference configuration
-            2. Reproducibility seed
-            3. Tokenizer
-            4. Base Qwen model
-            5. QLoRA adapter
-
-        Model loading is intentionally done here rather than inside
-        generate(), so a multi-turn conversation does not reload the
-        model for every user message.
+        Loads:
+        - inference configuration
+        - tokenizer
+        - Qwen base model
+        - trained LoRA adapter
         """
 
-        self.config: dict[str, Any] = _load_inference_config()
+        self.config: InferenceConfig
+        self.tokenizer: Any
+        self.model: torch.nn.Module
 
-        if not self.config["inference"]["enabled"]:
-            raise RuntimeError(
-                "Inference is disabled in the inference configuration."
-            )
-
-        # Make generation reproducible according to the configured seed.
-        _set_reproducibility_seed(
-            self.config["inference"]["reproducibility"]["seed"]
-        )
-
-        # Load tokenizer once.
-        self.tokenizer = _load_tokenizer(self.config)
-
-        # Load the quantized base model once.
-        self.model = _load_base_model(
+        (
             self.config,
-        )
-
-        # Attach the exported LoRA adapter once.
-        self.model = _load_lora_adapter(
+            self.tokenizer,
             self.model,
-            self.config,
-        )
-
-        # Used by health_check() to confirm initialization completed.
-        self._initialized = True
+        ) = load_inference_stack()
 
     def generate(
         self,
         messages: list[dict[str, str]],
     ) -> str:
         """
-        Generate an assistant response from a conversation.
+        Generate an assistant response from the local model.
 
         Parameters
         ----------
         messages:
-            Conversation history in chat-message format.
-
-            Example:
-                [
-                    {
-                        "role": "system",
-                        "content": "You are a financial assistant."
-                    },
-                    {
-                        "role": "user",
-                        "content": "What is revenue?"
-                    }
-                ]
+            Conversation history in standard chat-message format.
 
         Returns
         -------
         str
             The generated assistant response.
+
+        Raises
+        ------
+        ValueError
+            If messages are empty or malformed.
+        RuntimeError
+            If model generation fails.
         """
 
-        if not self._initialized:
-            raise RuntimeError(
-                "LocalProvider has not been initialized."
-            )
-
         if not isinstance(messages, list):
-            raise TypeError("messages must be a list.")
+            raise ValueError("messages must be a list.")
 
         if not messages:
             raise ValueError("messages cannot be empty.")
 
-        # Build the model-ready chat prompt using the tokenizer's
-        # Qwen chat template.
-        prompt = _build_prompt(
-            self.tokenizer,
-            messages,
-        )
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(
+                    "Each message must be a dictionary."
+                )
 
-        # Run generation through the existing inference engine.
-        result: GenerationResult = generate_response(
-            self.model,
-            self.tokenizer,
-            prompt,
-            self.config,
-        )
+            if "role" not in message or "content" not in message:
+                raise ValueError(
+                    "Each message must contain 'role' and 'content'."
+                )
 
-        response = result.get("response")
+            if not isinstance(message["role"], str):
+                raise ValueError(
+                    "Message 'role' must be a string."
+                )
 
-        if not isinstance(response, str):
-            raise RuntimeError(
-                "Inference engine returned an invalid response."
+            if not isinstance(message["content"], str):
+                raise ValueError(
+                    "Message 'content' must be a string."
+                )
+
+        try:
+            prompt = _build_prompt(
+                tokenizer=self.tokenizer,
+                messages=messages,
             )
 
-        return response
+            result = generate_response(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                prompt=prompt,
+                config=self.config,
+            )
+
+            return result.response
+
+        except Exception as exc:
+            raise RuntimeError(
+                "Local model generation failed."
+            ) from exc
 
     def name(self) -> str:
         """
@@ -156,11 +131,15 @@ class LocalProvider(BaseProvider):
 
     def health_check(self) -> bool:
         """
-        Check whether the local provider is initialized and ready.
+        Check whether the local inference stack is loaded.
+
+        Returns
+        -------
+        bool
+            True when the model and tokenizer are available.
         """
 
         return (
-            self._initialized
-            and self.model is not None
+            self.model is not None
             and self.tokenizer is not None
         )

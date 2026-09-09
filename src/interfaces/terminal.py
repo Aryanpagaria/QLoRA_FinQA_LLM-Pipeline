@@ -1,9 +1,13 @@
 """
 Terminal interface for the financial assistant.
 
-This module is responsible only for user interaction through the
-command line. Application logic and model inference remain in the
-application/provider layers.
+This module is responsible only for:
+- reading user input
+- displaying responses
+- handling terminal commands
+
+Application logic belongs to ChatService.
+Model logic belongs to providers/inference.
 """
 
 from src.application.chat_service import ChatService
@@ -11,87 +15,144 @@ from src.application.chat_service import ChatService
 
 class TerminalInterface:
     """
-    Interactive terminal interface for ChatService.
+    Command-line interface for the financial assistant.
     """
 
-    def __init__(self, chat_service: ChatService) -> None:
+    def __init__(
+        self,
+        chat_service: ChatService,
+    ) -> None:
         """
         Initialize the terminal interface.
-
-        Parameters
-        ----------
-        chat_service:
-            Application service responsible for processing messages.
         """
 
-        if not isinstance(chat_service, ChatService):
-            raise TypeError(
-                "chat_service must be an instance of ChatService."
+        if chat_service is None:
+            raise ValueError(
+                "chat_service cannot be None."
             )
 
         self.chat_service = chat_service
 
     def run(self) -> None:
         """
-        Start the interactive terminal chat loop.
+        Start the interactive terminal chat.
         """
 
         self._print_welcome()
 
         while True:
             try:
-                user_input = input("\nYou: ").strip()
+                question = input("\nYou: ").strip()
 
             except (KeyboardInterrupt, EOFError):
                 print("\n\nExiting...")
                 break
 
-            if not user_input:
+            if not question:
                 continue
 
-            command = user_input.lower()
-
-            if command in {"exit", "quit", "q"}:
-                print("Goodbye!")
+            if self._is_exit_command(question):
+                print("\nGoodbye!")
                 break
 
-            if command in {"clear", "reset"}:
-                self.chat_service.reset()
-                print("Conversation cleared.")
+            if question.lower() == "clear":
+                self.chat_service.clear_history()
+                print("\nConversation history cleared.")
                 continue
 
-            if command == "help":
-                self._print_help()
+            if question.lower() == "history":
+                self._print_history()
                 continue
 
             try:
-                response = self.chat_service.chat(user_input)
-                print(f"\nAssistant: {response}")
+                print("\nAssistant: ", end="", flush=True)
+
+                response = self.chat_service.ask(question)
+
+                print(response)
 
             except Exception as exc:
                 print(
-                    f"\nError: {exc}"
+                    "\nError: "
+                    f"{exc}"
                 )
 
+    def _is_exit_command(
+        self,
+        question: str,
+    ) -> bool:
+        """
+        Check whether the user requested to exit.
+        """
+
+        exit_commands = {
+            "exit",
+            "quit",
+            "q",
+        }
+
+        configured_commands = getattr(
+            self.chat_service.provider,
+            "config",
+            None,
+        )
+
+        if configured_commands is not None:
+            try:
+                configured_commands = (
+                    configured_commands.inference
+                    .chat
+                    .exit_commands
+                )
+
+                exit_commands.update(
+                    command.lower()
+                    for command in configured_commands
+                )
+
+            except AttributeError:
+                pass
+
+        return question.lower() in exit_commands
+
     def _print_welcome(self) -> None:
-        """Print the terminal application's welcome message."""
+        """
+        Display the terminal startup message.
+        """
 
         print("=" * 60)
         print("Financial QA Assistant")
         print("=" * 60)
         print(
-            f"Provider: {self.chat_service.provider_name()}"
+            f"Provider: "
+            f"{self.chat_service.provider_name()}"
         )
-        print("\nType 'help' for commands.")
-        print("Type 'exit', 'quit', or 'q' to leave.")
+        print()
+        print("Ask a financial question to begin.")
+        print("Commands:")
+        print("  clear   - Clear conversation history")
+        print("  history - Show conversation history")
+        print("  exit    - Exit the application")
+        print("=" * 60)
 
-    def _print_help(self) -> None:
-        """Print available terminal commands."""
+    def _print_history(self) -> None:
+        """
+        Display the current conversation history.
+        """
 
-        print("\nAvailable commands:")
-        print("  help   - Show this help message")
-        print("  clear  - Clear the current conversation")
-        print("  reset  - Clear the current conversation")
-        print("  exit   - Exit the application")
-        print("  quit   - Exit the application")
-        print("  q      - Exit the application")
+        history = self.chat_service.history()
+
+        if not history:
+            print("\nNo conversation history.")
+            return
+
+        print("\nConversation history:")
+        print("-" * 60)
+
+        for message in history:
+            role = message["role"].capitalize()
+            content = message["content"]
+
+            print(f"{role}: {content}")
+
+        print("-" * 60)

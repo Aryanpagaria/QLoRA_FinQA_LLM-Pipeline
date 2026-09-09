@@ -1,24 +1,33 @@
 """
-Application service for conversational chat.
+Application-level chat service.
 
-Coordinates the conversation session and model provider.
-The interface layer should communicate with ChatService instead of
-directly interacting with the model.
+This module coordinates conversation sessions and model providers.
+
+It does not know how the underlying model works. The provider abstraction
+allows the same service to work with the local QLoRA model, Gemini, or
+another provider added later.
 """
 
-from .session import Session
+from src.application.session import ChatSession
 from src.providers.base import BaseProvider
 
 
 class ChatService:
     """
-    Main application service responsible for processing chat messages.
+    Coordinate user messages, conversation history, and model responses.
+
+    Responsibilities:
+        1. Receive a user question.
+        2. Add it to the current session.
+        3. Send the conversation to the selected provider.
+        4. Store the assistant response.
+        5. Return the response to the interface.
     """
 
     def __init__(
         self,
         provider: BaseProvider,
-        session: Session | None = None,
+        session: ChatSession | None = None,
     ) -> None:
         """
         Initialize the chat service.
@@ -26,88 +35,135 @@ class ChatService:
         Parameters
         ----------
         provider:
-            Model provider responsible for generating responses.
+            Model provider used to generate responses.
 
         session:
-            Conversation session. If omitted, a new session is created.
+            Optional existing conversation session.
+            A new session is created when one is not provided.
         """
 
-        if not isinstance(provider, BaseProvider):
-            raise TypeError(
-                "provider must be an instance of BaseProvider."
-            )
+        if provider is None:
+            raise ValueError("provider cannot be None.")
 
         self.provider = provider
-        self.session = session or Session()
 
-    def chat(self, user_message: str) -> str:
+        self.session = (
+            session
+            if session is not None
+            else ChatSession()
+        )
+
+    def ask(self, question: str) -> str:
         """
-        Process one user message and return the assistant response.
+        Send a user question through the conversation pipeline.
 
-        The message is added to the session, sent to the provider,
-        and the generated response is added back to the session.
+        Parameters
+        ----------
+        question:
+            User's message.
+
+        Returns
+        -------
+        str
+            Assistant's generated response.
         """
 
-        if not isinstance(user_message, str):
-            raise TypeError("user_message must be a string.")
+        if not isinstance(question, str):
+            raise ValueError("question must be a string.")
 
-        user_message = user_message.strip()
+        question = question.strip()
 
-        if not user_message:
-            raise ValueError("user_message cannot be empty.")
+        if not question:
+            raise ValueError("question cannot be empty.")
 
-        self.session.add_user_message(user_message)
+        # Add the user's message before generation so the model
+        # receives the complete conversation.
+        self.session.add_user_message(question)
 
         try:
             response = self.provider.generate(
-                self.session.get_messages()
+                self.session.messages()
             )
         except Exception:
-            # Remove the user message if generation fails so the
-            # session does not retain an unanswered request.
+            # If generation fails, remove the user message that was
+            # just added so the session remains consistent.
             self._remove_last_user_message()
             raise
 
         if not isinstance(response, str):
+            self._remove_last_user_message()
             raise RuntimeError(
-                "Provider returned an invalid response."
+                "Provider returned a non-string response."
             )
 
         response = response.strip()
 
         if not response:
+            self._remove_last_user_message()
             raise RuntimeError(
                 "Provider returned an empty response."
             )
 
+        # Store the assistant response only after successful generation.
         self.session.add_assistant_message(response)
 
         return response
 
-    def reset(self) -> None:
-        """Clear the current conversation history."""
+    def history(self) -> list[dict[str, str]]:
+        """
+        Return the current conversation history.
+        """
+
+        return self.session.messages()
+
+    def clear_history(self) -> None:
+        """
+        Clear the current conversation while preserving the
+        session's system message.
+        """
 
         self.session.clear()
 
-    def get_history(self) -> list[dict[str, str]]:
-        """Return a copy of the current conversation history."""
-
-        return self.session.get_messages()
-
     def provider_name(self) -> str:
-        """Return the name of the active model provider."""
+        """
+        Return the name of the currently configured provider.
+        """
 
         return self.provider.name()
 
     def health_check(self) -> bool:
-        """Return whether the active provider is ready."""
+        """
+        Check whether the configured provider is available.
+        """
 
         return self.provider.health_check()
 
     def _remove_last_user_message(self) -> None:
-        """Remove the latest user message after a failed generation."""
+        """
+        Remove the most recently added user message.
 
-        messages = self.session.messages
+        This is used when provider generation fails, preventing a failed
+        request from leaving an incomplete message in the conversation.
+        """
 
-        if messages and messages[-1]["role"] == "user":
-            messages.pop()
+        messages = self.session.messages()
+
+        if not messages:
+            return
+
+        if messages[-1]["role"] != "user":
+            return
+
+        messages.pop()
+
+        self.session.clear()
+
+        for message in messages:
+            if message["role"] == "user":
+                self.session.add_user_message(
+                    message["content"]
+                )
+            elif message["role"] == "assistant":
+                self.session.add_assistant_message(
+                    message["content"]
+                )

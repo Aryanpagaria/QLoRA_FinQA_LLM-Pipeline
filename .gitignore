@@ -125,3 +125,7 @@ artifacts/best_model/*.pt
 # ==========================================================
 !artifacts/lora_adapter/
 !artifacts/lora_adapter/**
+
+
+__pycache__/
+*.py[cod]

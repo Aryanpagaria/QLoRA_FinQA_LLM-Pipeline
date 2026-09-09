@@ -1,5 +1,4 @@
 from __future__ import annotations
-from transformers import PreTrainedTokenizerBase
 import copy
 import random
 import time
@@ -1365,7 +1364,7 @@ def generate_response(
         response = tokenizer.decode(
             generated_token_ids,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
+            clean_up_tokenization_spaces=False,
         ).strip()
 
     except Exception as error:
@@ -1457,294 +1456,55 @@ def _trim_history(
     ]
 
 
-def run_single_query(
-    question: str,
-) -> GenerationResult:
+def load_inference_stack() -> tuple[
+    InferenceConfig,
+    PreTrainedTokenizerBase,
+    torch.nn.Module,
+]:
     """
-    Load the production inference stack and answer one question.
+    Load the complete production inference stack once.
+
+    This is the public entry point used by LocalProvider.
+
+    The function:
+    1. Loads and validates inference configuration.
+    2. Sets the reproducibility seed.
+    3. Loads the tokenizer.
+    4. Loads the base Qwen model.
+    5. Loads the exported LoRA adapter.
+    6. Returns the ready-to-use inference components.
+
+    Returns
+    -------
+    tuple
+        (config, tokenizer, model)
+
+    Raises
+    ------
+    RuntimeError
+        If inference is disabled or any part of the inference stack
+        cannot be loaded.
     """
 
     config = _load_inference_config()
 
-    if not config[
-        "inference"
-    ][
-        "enabled"
-    ]:
+    if not config.inference.enabled:
         raise RuntimeError(
-            "Inference is disabled in configuration."
+            "Inference is disabled in configs/inference/inference.yaml."
         )
 
-    _set_reproducibility_seed(
-        config[
-            "inference"
-        ][
-            "reproducibility"
-        ][
-            "seed"
-        ]
-    )
+    _set_reproducibility_seed(config)
 
-    tokenizer = _load_tokenizer(
-        config
-    )
+    tokenizer = _load_tokenizer(config)
 
-    model = _load_base_model(
-        config
-    )
+    model = _load_base_model(config)
 
     model = _load_lora_adapter(
         model=model,
         config=config,
     )
 
-    system_message = config[
-        "inference"
-    ][
-        "prompt"
-    ].get(
-        "system_message",
-        (
-            "You are a helpful financial assistant."
-        ),
-    )
-
-    messages = _build_messages(
-        history=[],
-        user_prompt=question,
-        system_message=system_message,
-    )
-
-    prompt = _build_prompt(
-        tokenizer=tokenizer,
-        messages=messages,
-    )
-
-    result = generate_response(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        config=config,
-    )
-
-    return result
-
-
-def interactive_chat(
-    model: torch.nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
-    config: InferenceConfig,
-) -> None:
-    """
-    Run the production interactive financial assistant.
-    """
-
-    if not isinstance(
-        model,
-        torch.nn.Module,
-    ):
-        raise TypeError(
-            "model must be a torch.nn.Module."
-        )
-
-    if not isinstance(
-        tokenizer,
-        PreTrainedTokenizerBase,
-    ):
-        raise TypeError(
-            "tokenizer must be a "
-            "PreTrainedTokenizerBase."
-        )
-
-    inference_config = config[
-        "inference"
-    ]
-
-    chat_config = inference_config[
-        "chat"
-    ]
-
-    system_message = inference_config[
-        "prompt"
-    ].get(
-        "system_message",
-        (
-            "You are a helpful financial assistant."
-        ),
-    )
-
-    exit_commands = {
-        command.strip().lower()
-        for command in chat_config[
-            "exit_commands"
-        ]
-    }
-
-    max_history = chat_config[
-        "max_history"
-    ]
-
-    logger = None
-
-    try:
-
-        from src.utils.log import get_logger
-
-        logger = get_logger(
-            "inference"
-        )
-
-    except Exception:
-        logger = None
-
-    history: list[
-        dict[str, str]
-    ] = []
-
-    print("=" * 80)
-    print("FINANCIAL LORA ASSISTANT")
-    print("=" * 80)
-    print(
-        "Type 'exit' to quit."
-    )
-    print("=" * 80)
-
-    while True:
-
-        try:
-
-            user_prompt = input(
-                "\nYou : "
-            ).strip()
-
-        except EOFError:
-
-            print(
-                "\nInput stream closed."
-            )
-
-            break
-
-        except KeyboardInterrupt:
-
-            print(
-                "\n\nInference interrupted."
-            )
-
-            break
-
-        if not user_prompt:
-
-            print(
-                "Please enter a non-empty question."
-            )
-
-            continue
-
-        if user_prompt.lower() in exit_commands:
-
-            print(
-                "\nGoodbye!"
-            )
-
-            break
-
-        try:
-
-            messages = _build_messages(
-                history=history,
-                user_prompt=user_prompt,
-                system_message=system_message,
-            )
-
-            messages = _trim_history(
-                history=messages,
-                max_history=max_history,
-            )
-
-            prompt = _build_prompt(
-                tokenizer=tokenizer,
-                messages=messages,
-            )
-
-            result = generate_response(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt,
-                config=config,
-            )
-
-            response = result[
-                "response"
-            ]
-
-            history = messages
-
-            history.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
-            )
-
-            history = _trim_history(
-                history=history,
-                max_history=max_history,
-            )
-
-            if logger is not None:
-
-                logger.info(
-                    f"User: {user_prompt}"
-                )
-
-                logger.info(
-                    f"Assistant: {response}"
-                )
-
-            print(
-                "\nAssistant:\n"
-            )
-
-            print(
-                response
-            )
-
-            print()
-            print("-" * 80)
-            print(
-                f"Prompt Tokens    : "
-                f"{result['prompt_tokens']}"
-            )
-            print(
-                f"Generated Tokens : "
-                f"{result['generated_tokens']}"
-            )
-            print(
-                f"Generation Time  : "
-                f"{result['generation_time']:.2f} sec"
-            )
-            print(
-                f"Tokens / Second  : "
-                f"{result['tokens_per_second']:.2f}"
-            )
-            print("-" * 80)
-
-        except Exception as error:
-
-            if logger is not None:
-
-                logger.exception(
-                    "Inference request failed."
-                )
-
-            print(
-                "\nInference request failed:"
-            )
-
-            print(
-                f"{type(error).__name__}: {error}"
-            )
+    return config, tokenizer, model
 
 class _TestTokenizer(PreTrainedTokenizerBase):
     """
