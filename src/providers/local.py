@@ -61,7 +61,9 @@ class LocalProvider(BaseProvider):
             )
 
         # Make generation reproducible according to the configured seed.
-        _set_reproducibility_seed(self.config)
+        _set_reproducibility_seed(
+            self.config["inference"]["reproducibility"]["seed"]
+        )
 
         # Load tokenizer once.
         self.tokenizer = _load_tokenizer(self.config)
