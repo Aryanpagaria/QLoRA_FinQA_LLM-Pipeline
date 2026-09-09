@@ -1488,7 +1488,7 @@ def load_inference_stack() -> tuple[
 
     config = _load_inference_config()
 
-    if not config.inference.enabled:
+    if not config["inference"]["enabled"]:
         raise RuntimeError(
             "Inference is disabled in configs/inference/inference.yaml."
         )
