@@ -71,7 +71,6 @@ class LocalProvider(BaseProvider):
         # Load the quantized base model once.
         self.model = _load_base_model(
             self.config,
-            self.tokenizer,
         )
 
         # Attach the exported LoRA adapter once.
