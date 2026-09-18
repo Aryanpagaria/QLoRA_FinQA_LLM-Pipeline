@@ -12,7 +12,8 @@ Evaluates a local causal language model on the FinQA test split and records:
 The runner is deterministic and stores both per-example predictions and
 aggregate benchmark results.
 """
-
+import json
+from pathlib import Path
 from __future__ import annotations
 
 import argparse
@@ -162,32 +163,81 @@ def load_finqa_split(
     max_examples: int | None,
 ) -> Any:
     """
-    Load the requested FinQA split from Hugging Face.
+    Load FinQA directly from the official dataset files.
+
+    The loader avoids the deprecated Hugging Face dataset-script
+    mechanism and reads the JSON split files directly.
     """
 
-    dataset = load_dataset(
-        "ibm/finqa",
-        split=split,
-    )
-
-    if max_examples is not None:
-        dataset = dataset.select(
-            range(
-                min(
-                    max_examples,
-                    len(dataset),
-                )
-            )
+    if split not in {
+        "train",
+        "dev",
+        "test",
+    }:
+        raise ValueError(
+            "split must be one of: train, dev, test."
         )
 
-    if len(dataset) == 0:
+    dataset_directory = (
+        Path("evaluation")
+        / "datasets"
+        / "finqa"
+    )
+
+    dataset_file = (
+        dataset_directory
+        / f"{split}.json"
+    )
+
+    if not dataset_file.exists():
+        raise FileNotFoundError(
+            "FinQA dataset file was not found: "
+            f"{dataset_file}. "
+            "Download the official FinQA JSON files into "
+            f"{dataset_directory}."
+        )
+
+    try:
+        with dataset_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            records = json.load(file)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Invalid JSON in FinQA dataset file: {dataset_file}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Unable to read FinQA dataset file: {dataset_file}"
+        ) from exc
+
+    if not isinstance(records, list):
+        raise RuntimeError(
+            f"FinQA dataset file must contain a JSON list: {dataset_file}"
+        )
+
+    if max_examples is not None:
+        if max_examples <= 0:
+            raise ValueError(
+                "max_examples must be greater than zero."
+            )
+
+        records = records[
+            :min(
+                max_examples,
+                len(records),
+            )
+        ]
+
+    if not records:
         raise RuntimeError(
             f"FinQA split '{split}' contains no examples."
         )
 
-    return dataset
+    return records
 
-
+    
 def normalize_text(
     text: str,
 ) -> str:
