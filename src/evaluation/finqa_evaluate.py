@@ -753,9 +753,7 @@ def main() -> None:
         args
     )
 
-    set_seed(
-        42
-    )
+    set_seed()
 
     print(
         "Loading FinQA dataset..."
