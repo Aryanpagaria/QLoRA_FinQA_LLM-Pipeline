@@ -74,3 +74,7 @@ evaluation/reports/
 # Local IDE/runtime files
 *.bak
 *.swp
+
+
+# Evaluation datasets
+evaluation/datasets/
