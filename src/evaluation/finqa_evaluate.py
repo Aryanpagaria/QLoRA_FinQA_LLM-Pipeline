@@ -12,8 +12,7 @@ Evaluates a local causal language model on the FinQA test split and records:
 The runner is deterministic and stores both per-example predictions and
 aggregate benchmark results.
 """
-import json
-from pathlib import Path
+
 from __future__ import annotations
 
 import argparse
@@ -21,11 +20,12 @@ import json
 import math
 import re
 import statistics
+import json
+from pathlib import Path
 import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -237,7 +237,7 @@ def load_finqa_split(
 
     return records
 
-    
+
 def normalize_text(
     text: str,
 ) -> str:
