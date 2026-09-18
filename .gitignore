@@ -78,3 +78,7 @@ evaluation/reports/
 
 # Evaluation datasets
 evaluation/datasets/
+
+# Deployable LoRA adapter
+!artifacts/lora_adapter/
+!artifacts/lora_adapter/**
