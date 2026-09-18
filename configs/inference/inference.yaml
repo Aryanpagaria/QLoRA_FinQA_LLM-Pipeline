@@ -6,7 +6,7 @@ inference:
     adapter_directory: artifacts/lora_adapter
 
   generation:
-    max_new_tokens: 256
+    max_new_tokens: 1024
     do_sample: false
     temperature: 0.0
     top_p: 1.0
