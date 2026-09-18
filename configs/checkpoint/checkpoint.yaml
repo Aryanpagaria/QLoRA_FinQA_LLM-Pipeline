@@ -2,7 +2,7 @@ checkpoint:
   root_directory: checkpoints
   latest_directory: checkpoints/latest
   best_directory: best_model
-  lora_export_directory: lora_adapter
+  lora_export_directory: artifacts/lora_adapter
   state_directory: checkpoints/state
 
   save_strategy: epoch
