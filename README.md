@@ -514,38 +514,7 @@ The engineering emphasis is on **reproducibility, checkpoint integrity,
 evaluation correctness, and production-oriented inference**, not just
 obtaining a fine-tuned model.
 
-------------------------------------------------------------------------
 
-## Current status
-
-### Completed and tested
-
--   [x] Configuration system
--   [x] Dataset preprocessing integration
--   [x] Tokenizer integration
--   [x] QLoRA model configuration
--   [x] LoRA configuration
--   [x] Optimizer
--   [x] Scheduler
--   [x] Trainer
--   [x] Checkpoint subsystem
--   [x] Checkpoint resume validation
--   [x] RNG persistence/restoration
--   [x] Evaluator module
--   [x] Evaluation metric logic
--   [x] Evaluation data preparation
-
-### Final experiment / integration
-
--   [ ] Complete production inference entry point
--   [ ] Run the complete 10-epoch training experiment
--   [ ] Evaluate the resulting trained checkpoint
--   [ ] Run controlled inference examples
--   [ ] Compare base-model and fine-tuned-model performance
--   [ ] Add measured benchmark results
-
-No performance numbers are claimed here until the complete experiment
-has actually been run.
 
 ------------------------------------------------------------------------
 
