@@ -1,16 +1,24 @@
 """
 FinQA benchmark evaluation runner.
 
-Evaluates a local causal language model on the FinQA test split and records:
-- Exact Match
-- Numerical Accuracy
-- Invalid Prediction Rate
-- Average Generation Latency
-- Generated Tokens
-- Generation Throughput
+Evaluates:
+    1. Qwen/Qwen2.5-3B-Instruct
+    2. Qwen/Qwen2.5-3B-Instruct + trained LoRA adapter
 
-The runner is deterministic and stores both per-example predictions and
-aggregate benchmark results.
+The benchmark evaluates answer generation rather than FinQA program
+generation.
+
+Metrics:
+    - Normalized Exact Match
+    - Numerical Accuracy
+    - Invalid Prediction Rate
+    - Average Generation Latency
+    - Median Generation Latency
+    - Generated Tokens
+    - Generation Throughput
+
+Per-example predictions and aggregate metrics are saved under:
+    evaluation/results/
 """
 
 from __future__ import annotations
@@ -20,16 +28,14 @@ import json
 import math
 import re
 import statistics
-import json
-from pathlib import Path
 import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import load_dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -37,27 +43,40 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.generation import generate_response
-from src.inference.inference import load_inference_stack
+from src.inference.inference import (
+    _load_base_model,
+    _load_inference_config,
+    _load_lora_adapter,
+    _load_tokenizer,
+    _set_reproducibility_seed,
+)
 from src.utils.seed import set_seed
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ExampleResult:
-    """
-    Evaluation result for a single FinQA example.
-    """
+    """Evaluation result for one FinQA example."""
 
     example_id: str
     question: str
     gold_answer: str
     prediction: str
+
     normalized_gold: str
     normalized_prediction: str
-    predicted_number: float | None
+
     gold_number: float | None
+    predicted_number: float | None
+
     exact_match: bool
     numerical_accuracy: bool
     invalid_prediction: bool
+
     input_tokens: int
     generated_tokens: int
     latency_seconds: float
@@ -65,66 +84,77 @@ class ExampleResult:
 
 @dataclass(frozen=True)
 class BenchmarkResult:
-    """
-    Aggregate FinQA benchmark result.
-    """
+    """Aggregate benchmark result."""
 
     benchmark: str
     split: str
     model_type: str
+    base_model: str
+    adapter_used: bool
+
     evaluated_examples: int
+
     exact_match: float
     numerical_accuracy: float
     invalid_prediction_rate: float
+
     average_latency_seconds: float
     median_latency_seconds: float
+
     total_generated_tokens: int
     average_generated_tokens: float
     generation_tokens_per_second: float
+
     evaluation_timestamp_utc: str
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command-line arguments.
-    """
+    """Parse command-line arguments."""
 
     parser = argparse.ArgumentParser(
-        description="Evaluate a local model on the FinQA test benchmark."
+        description="Evaluate Qwen/QLoRA on the FinQA benchmark."
     )
 
     parser.add_argument(
         "--split",
         default="test",
-        choices=("train", "validation", "test"),
-        help="FinQA dataset split to evaluate.",
+        choices=("train", "dev", "test"),
+        help="FinQA split to evaluate.",
     )
 
     parser.add_argument(
         "--max-examples",
         type=int,
         default=None,
-        help="Optional limit for development runs.",
+        help="Optional number of examples for smoke tests.",
     )
 
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
-        help="Maximum number of generated tokens per example.",
+        help="Maximum number of generated tokens.",
     )
 
     parser.add_argument(
         "--model-type",
         default="local-lora",
         choices=("base", "local-lora"),
-        help="Model configuration to evaluate.",
+        help=(
+            "Evaluate either the base Qwen model or "
+            "the trained local LoRA model."
+        ),
     )
 
     parser.add_argument(
         "--output-prefix",
         default=None,
-        help="Optional output filename prefix.",
+        help="Optional prefix for result files.",
     )
 
     return parser.parse_args()
@@ -133,14 +163,9 @@ def parse_arguments() -> argparse.Namespace:
 def validate_arguments(
     args: argparse.Namespace,
 ) -> None:
-    """
-    Validate command-line arguments.
-    """
+    """Validate command-line arguments."""
 
-    if (
-        args.max_examples is not None
-        and args.max_examples <= 0
-    ):
+    if args.max_examples is not None and args.max_examples <= 0:
         raise ValueError(
             "--max-examples must be a positive integer."
         )
@@ -152,49 +177,45 @@ def validate_arguments(
 
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA is not available. Run the full FinQA benchmark "
-            "on the Colab GPU environment rather than the CPU-only "
-            "Windows development environment."
+            "CUDA is not available. "
+            "Run model evaluation in the Colab GPU environment."
         )
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 
 def load_finqa_split(
     split: str,
     max_examples: int | None,
-) -> Any:
+) -> list[dict[str, Any]]:
     """
-    Load FinQA directly from the official dataset files.
+    Load an official FinQA JSON split.
 
-    The loader avoids the deprecated Hugging Face dataset-script
-    mechanism and reads the JSON split files directly.
+    Files expected:
+        evaluation/datasets/finqa/train.json
+        evaluation/datasets/finqa/dev.json
+        evaluation/datasets/finqa/test.json
     """
 
-    if split not in {
-        "train",
-        "dev",
-        "test",
-    }:
+    if split not in {"train", "dev", "test"}:
         raise ValueError(
             "split must be one of: train, dev, test."
         )
 
-    dataset_directory = (
-        Path("evaluation")
+    dataset_file = (
+        PROJECT_ROOT
+        / "evaluation"
         / "datasets"
         / "finqa"
-    )
-
-    dataset_file = (
-        dataset_directory
         / f"{split}.json"
     )
 
-    if not dataset_file.exists():
+    if not dataset_file.is_file():
         raise FileNotFoundError(
-            "FinQA dataset file was not found: "
-            f"{dataset_file}. "
-            "Download the official FinQA JSON files into "
-            f"{dataset_directory}."
+            f"FinQA dataset file was not found: {dataset_file}"
         )
 
     try:
@@ -203,32 +224,19 @@ def load_finqa_split(
             encoding="utf-8",
         ) as file:
             records = json.load(file)
+
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"Invalid JSON in FinQA dataset file: {dataset_file}"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(
-            f"Unable to read FinQA dataset file: {dataset_file}"
+            f"Invalid JSON in {dataset_file}"
         ) from exc
 
     if not isinstance(records, list):
         raise RuntimeError(
-            f"FinQA dataset file must contain a JSON list: {dataset_file}"
+            f"FinQA file must contain a JSON list: {dataset_file}"
         )
 
     if max_examples is not None:
-        if max_examples <= 0:
-            raise ValueError(
-                "max_examples must be greater than zero."
-            )
-
-        records = records[
-            :min(
-                max_examples,
-                len(records),
-            )
-        ]
+        records = records[:max_examples]
 
     if not records:
         raise RuntimeError(
@@ -238,27 +246,26 @@ def load_finqa_split(
     return records
 
 
-def normalize_text(
-    text: str,
-) -> str:
+# ---------------------------------------------------------------------------
+# Answer handling
+# ---------------------------------------------------------------------------
+
+
+def normalize_text(text: Any) -> str:
     """
-    Normalize text for exact-match comparison.
+    Normalize an answer for diagnostic exact-match comparison.
+
+    This is intentionally a lightweight diagnostic metric and is not
+    claimed to be the official FinQA program/execution metric.
     """
 
-    if not isinstance(text, str):
+    if text is None:
         return ""
 
-    normalized = text.lower().strip()
+    normalized = str(text).lower().strip()
 
-    normalized = normalized.replace(
-        "$",
-        "",
-    )
-
-    normalized = normalized.replace(
-        ",",
-        "",
-    )
+    normalized = normalized.replace("$", "")
+    normalized = normalized.replace(",", "")
 
     normalized = re.sub(
         r"\s+",
@@ -276,24 +283,24 @@ def normalize_text(
 
 
 def parse_number(
-    text: str,
+    text: Any,
 ) -> float | None:
     """
-    Extract a numeric answer from generated text.
+    Extract the first numeric value from a prediction.
 
-    Handles:
-    - integers
-    - decimals
-    - percentages
-    - negative values
-    - comma-separated values
-    - simple scientific notation
+    Supports:
+        - integers
+        - decimals
+        - negative numbers
+        - comma-separated numbers
+        - percentages
+        - scientific notation
     """
 
-    if not isinstance(text, str):
+    if text is None:
         return None
 
-    cleaned = text.strip()
+    cleaned = str(text).strip()
 
     if not cleaned:
         return None
@@ -304,13 +311,11 @@ def parse_number(
     )
 
     if percentage_match:
-        value = percentage_match.group(0)
-        value = value.replace(
-            "%",
-            "",
-        ).replace(
-            ",",
-            "",
+        value = (
+            percentage_match.group(0)
+            .replace("%", "")
+            .replace(",", "")
+            .strip()
         )
 
         try:
@@ -327,10 +332,7 @@ def parse_number(
     if number_match is None:
         return None
 
-    value = number_match.group(0).replace(
-        ",",
-        "",
-    )
+    value = number_match.group(0).replace(",", "")
 
     try:
         return float(value)
@@ -342,9 +344,7 @@ def numbers_are_equivalent(
     predicted: float | None,
     gold: float | None,
 ) -> bool:
-    """
-    Compare numeric values using a relative and absolute tolerance.
-    """
+    """Compare numeric answers with a small tolerance."""
 
     if predicted is None or gold is None:
         return False
@@ -360,21 +360,28 @@ def numbers_are_equivalent(
     )
 
 
+# ---------------------------------------------------------------------------
+# FinQA example extraction
+# ---------------------------------------------------------------------------
+
+
 def extract_question(
     example: dict[str, Any],
 ) -> str:
-    """
-    Extract the natural-language question from a FinQA example.
-    """
+    """Extract the FinQA question."""
 
-    question = example.get("qa", {}).get(
-        "question",
-        "",
-    )
+    qa = example.get("qa")
+
+    if not isinstance(qa, dict):
+        raise ValueError(
+            "FinQA example does not contain a valid qa object."
+        )
+
+    question = qa.get("question")
 
     if not isinstance(question, str) or not question.strip():
         raise ValueError(
-            "FinQA example does not contain a valid QA question."
+            "FinQA example does not contain a valid question."
         )
 
     return question.strip()
@@ -384,32 +391,46 @@ def extract_gold_answer(
     example: dict[str, Any],
 ) -> str:
     """
-    Extract the gold answer from a FinQA example.
+    Extract the human-readable FinQA answer.
+
+    IMPORTANT:
+    The current QLoRA model was trained to generate qa.answer,
+    not qa.program. Therefore the answer-generation benchmark
+    uses qa.answer as its primary target.
+
+    qa.exe_ans remains part of the source dataset and is useful
+    for future program/execution evaluation.
     """
 
-    answer = example.get("qa", {}).get(
-        "answer",
-        "",
-    )
+    qa = example.get("qa")
 
-    if isinstance(answer, (int, float)):
-        return str(answer)
-
-    if not isinstance(answer, str) or not answer.strip():
+    if not isinstance(qa, dict):
         raise ValueError(
-            "FinQA example does not contain a valid gold answer."
+            "FinQA example does not contain a valid qa object."
         )
 
-    return answer.strip()
+    answer = qa.get("answer")
+
+    if answer is None:
+        raise ValueError(
+            "FinQA example does not contain qa.answer."
+        )
+
+    answer = str(answer).strip()
+
+    if not answer:
+        raise ValueError(
+            "FinQA example contains an empty qa.answer."
+        )
+
+    return answer
 
 
 def extract_example_id(
     example: dict[str, Any],
     index: int,
 ) -> str:
-    """
-    Create a stable identifier for a benchmark example.
-    """
+    """Return a stable example identifier."""
 
     for key in (
         "id",
@@ -424,43 +445,196 @@ def extract_example_id(
     return f"finqa-{index:06d}"
 
 
+# ---------------------------------------------------------------------------
+# Prompt construction
+# ---------------------------------------------------------------------------
+
+
+def _coerce_context_fields(
+    example: dict[str, Any],
+) -> dict[str, str]:
+    """
+    Convert raw FinQA JSON fields into the same string representation
+    expected by the training preprocessing pipeline.
+
+    Training cleaning converts:
+        pre_text  -> paragraphs joined by '\\n\\n'
+        post_text -> paragraphs joined by '\\n\\n'
+
+    Raw FinQA JSON stores these fields as lists.
+    """
+
+    pre_text = example.get("pre_text", "")
+    post_text = example.get("post_text", "")
+    table = example.get("table", "")
+
+    if isinstance(pre_text, list):
+        pre_text = "\n\n".join(
+            str(item)
+            for item in pre_text
+        )
+    else:
+        pre_text = str(pre_text)
+
+    if isinstance(post_text, list):
+        post_text = "\n\n".join(
+            str(item)
+            for item in post_text
+        )
+    else:
+        post_text = str(post_text)
+
+    if isinstance(table, list):
+        rows: list[str] = []
+
+        for row in table:
+            if isinstance(row, list):
+                rows.append(
+                    " | ".join(
+                        str(cell)
+                        for cell in row
+                    )
+                )
+            else:
+                rows.append(str(row))
+
+        table = "\n".join(rows)
+
+    else:
+        table = str(table)
+
+    return {
+        "pre_text": pre_text,
+        "table": table,
+        "post_text": post_text,
+    }
+
+
+def _truncate_text(
+    text: str,
+    max_tokens: int,
+) -> str:
+    """
+    Truncate text using the same Qwen tokenizer mechanism
+    used by src.data.preprocessing.
+
+    This is deliberately token-based, NOT word-based.
+    """
+
+    if not isinstance(text, str):
+        return ""
+
+    text = text.strip()
+
+    if not text:
+        return ""
+
+    # Import here so normal module import remains lightweight.
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen2.5-3B-Instruct",
+        trust_remote_code=True,
+    )
+
+    token_ids = tokenizer.encode(
+        text,
+        add_special_tokens=False,
+    )
+
+    token_ids = token_ids[:max_tokens]
+
+    return tokenizer.decode(
+        token_ids,
+        skip_special_tokens=True,
+    ).strip()
+
+
 def build_prompt(
     example: dict[str, Any],
 ) -> str:
     """
-    Build a concise instruction prompt for FinQA.
+    Build the exact training-style FinQA prompt.
 
-    The benchmark evaluates answer generation. It does not inject the gold
-    answer or gold program into the prompt.
+    The model receives:
+        system instruction
+        financial context
+        question
+
+    The following are NEVER inserted:
+        qa.answer
+        qa.exe_ans
+        qa.program
     """
 
-    question = extract_question(
-        example
+    question = extract_question(example)
+
+    fields = _coerce_context_fields(example)
+
+    background = _truncate_text(
+        fields["pre_text"],
+        150,
+    )
+
+    financial_table = _truncate_text(
+        fields["table"],
+        180,
+    )
+
+    additional_context = _truncate_text(
+        fields["post_text"],
+        40,
+    )
+
+    sections: list[str] = []
+
+    if background:
+        sections.append(
+            "Background:\n"
+            f"{background}"
+        )
+
+    if financial_table:
+        sections.append(
+            "Financial Table:\n"
+            f"{financial_table}"
+        )
+
+    if additional_context:
+        sections.append(
+            "Additional Context:\n"
+            f"{additional_context}"
+        )
+
+    context = "\n\n".join(sections)
+
+    system_prompt = (
+        "You are a highly accurate financial AI assistant.\n\n"
+        "Answer financial questions using ONLY the provided "
+        "financial context.\n\n"
+        "If the context does not contain enough information, "
+        "say that the answer cannot be determined from the "
+        "provided information.\n\n"
+        "Do not fabricate facts."
+    )
+
+    user_prompt = (
+        "Financial Context:\n\n"
+        f"{context}\n\n"
+        "Question:\n\n"
+        f"{question}\n\n"
+        "Answer the question using only the provided financial context."
     )
 
     return (
-        "You are a financial question answering assistant.\n\n"
-        "Answer the following question using the provided financial "
-        "context when available.\n\n"
-        f"Question: {question}\n\n"
-        "Give the final answer clearly. "
-        "If the answer is numerical, provide the numerical result "
-        "and its unit or percentage when applicable."
+        f"{system_prompt}\n\n"
+        f"{user_prompt}"
     )
 
 
-def calculate_exact_match(
-    prediction: str,
-    gold_answer: str,
-) -> bool:
-    """
-    Calculate normalized exact-match accuracy.
-    """
-
-    return (
-        normalize_text(prediction)
-        == normalize_text(gold_answer)
-    )
+# ---------------------------------------------------------------------------
+# Per-example evaluation
+# ---------------------------------------------------------------------------
 
 
 def evaluate_example(
@@ -471,21 +645,12 @@ def evaluate_example(
     index: int,
     max_new_tokens: int,
 ) -> ExampleResult:
-    """
-    Generate and evaluate one FinQA example.
-    """
+    """Generate and evaluate one FinQA example."""
 
-    question = extract_question(
-        example
-    )
+    question = extract_question(example)
+    gold_answer = extract_gold_answer(example)
 
-    gold_answer = extract_gold_answer(
-        example
-    )
-
-    prompt = build_prompt(
-        example
-    )
+    prompt = build_prompt(example)
 
     start_time = time.perf_counter()
 
@@ -520,9 +685,9 @@ def evaluate_example(
         prediction
     )
 
-    exact_match = calculate_exact_match(
-        prediction=prediction,
-        gold_answer=gold_answer,
+    exact_match = (
+        normalized_prediction
+        == normalized_gold
     )
 
     numerical_accuracy = numbers_are_equivalent(
@@ -546,8 +711,8 @@ def evaluate_example(
         prediction=prediction,
         normalized_gold=normalized_gold,
         normalized_prediction=normalized_prediction,
-        predicted_number=predicted_number,
         gold_number=gold_number,
+        predicted_number=predicted_number,
         exact_match=exact_match,
         numerical_accuracy=numerical_accuracy,
         invalid_prediction=invalid_prediction,
@@ -557,23 +722,27 @@ def evaluate_example(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Aggregate metrics
+# ---------------------------------------------------------------------------
+
+
 def calculate_benchmark_metrics(
     results: list[ExampleResult],
     model_type: str,
     split: str,
+    base_model: str,
+    adapter_used: bool,
 ) -> BenchmarkResult:
-    """
-    Calculate aggregate benchmark metrics.
-    """
+    """Calculate aggregate benchmark metrics."""
 
     if not results:
         raise RuntimeError(
-            "Cannot calculate benchmark metrics from zero results."
+            "Cannot calculate metrics from zero results."
         )
 
-    example_count = len(
-        results
-    )
+    count = len(results)
 
     exact_match_count = sum(
         result.exact_match
@@ -600,50 +769,40 @@ def calculate_benchmark_metrics(
         for result in results
     )
 
-    total_latency = sum(
-        latencies
-    )
-
-    average_latency = (
-        total_latency
-        / example_count
-    )
-
-    median_latency = statistics.median(
-        latencies
-    )
-
-    average_generated_tokens = (
-        total_generated_tokens
-        / example_count
-    )
-
-    generation_tokens_per_second = (
-        total_generated_tokens / total_latency
-        if total_latency > 0
-        else 0.0
-    )
+    total_latency = sum(latencies)
 
     return BenchmarkResult(
         benchmark="FinQA",
         split=split,
         model_type=model_type,
-        evaluated_examples=example_count,
-        exact_match=exact_match_count / example_count,
+        base_model=base_model,
+        adapter_used=adapter_used,
+        evaluated_examples=count,
+        exact_match=(
+            exact_match_count / count
+        ),
         numerical_accuracy=(
-            numerical_accuracy_count
-            / example_count
+            numerical_accuracy_count / count
         ),
         invalid_prediction_rate=(
-            invalid_prediction_count
-            / example_count
+            invalid_prediction_count / count
         ),
-        average_latency_seconds=average_latency,
-        median_latency_seconds=median_latency,
-        total_generated_tokens=total_generated_tokens,
-        average_generated_tokens=average_generated_tokens,
+        average_latency_seconds=(
+            total_latency / count
+        ),
+        median_latency_seconds=statistics.median(
+            latencies
+        ),
+        total_generated_tokens=(
+            total_generated_tokens
+        ),
+        average_generated_tokens=(
+            total_generated_tokens / count
+        ),
         generation_tokens_per_second=(
-            generation_tokens_per_second
+            total_generated_tokens / total_latency
+            if total_latency > 0
+            else 0.0
         ),
         evaluation_timestamp_utc=(
             datetime.now(
@@ -653,14 +812,17 @@ def calculate_benchmark_metrics(
     )
 
 
+# ---------------------------------------------------------------------------
+# Saving results
+# ---------------------------------------------------------------------------
+
+
 def save_results(
     example_results: list[ExampleResult],
     benchmark_result: BenchmarkResult,
     output_prefix: str,
 ) -> tuple[Path, Path]:
-    """
-    Save per-example results and aggregate metrics.
-    """
+    """Save predictions and metrics."""
 
     results_directory = (
         PROJECT_ROOT
@@ -687,6 +849,7 @@ def save_results(
         "w",
         encoding="utf-8",
     ) as file:
+
         for result in example_results:
             file.write(
                 json.dumps(
@@ -700,6 +863,7 @@ def save_results(
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             asdict(benchmark_result),
             file,
@@ -707,66 +871,106 @@ def save_results(
             ensure_ascii=False,
         )
 
-    return predictions_path, metrics_path
+    return (
+        predictions_path,
+        metrics_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
 
 
 def print_summary(
     result: BenchmarkResult,
 ) -> None:
-    """
-    Print aggregate benchmark metrics.
-    """
+    """Print benchmark summary."""
 
     print()
     print("=" * 80)
     print("FINQA BENCHMARK RESULTS")
     print("=" * 80)
+
     print(
-        f"Model                  : {result.model_type}"
+        f"Model Type             : "
+        f"{result.model_type}"
     )
+
     print(
-        f"Split                  : {result.split}"
+        f"Base Model             : "
+        f"{result.base_model}"
     )
+
     print(
-        f"Examples               : {result.evaluated_examples}"
+        f"LoRA Adapter Used      : "
+        f"{result.adapter_used}"
     )
+
     print(
-        f"Exact Match            : {result.exact_match:.4%}"
+        f"Split                  : "
+        f"{result.split}"
     )
+
     print(
-        f"Numerical Accuracy     : {result.numerical_accuracy:.4%}"
+        f"Examples               : "
+        f"{result.evaluated_examples}"
     )
+
     print(
-        f"Invalid Prediction     : {result.invalid_prediction_rate:.4%}"
+        f"Exact Match            : "
+        f"{result.exact_match:.4%}"
     )
+
+    print(
+        f"Numerical Accuracy     : "
+        f"{result.numerical_accuracy:.4%}"
+    )
+
+    print(
+        f"Invalid Prediction     : "
+        f"{result.invalid_prediction_rate:.4%}"
+    )
+
     print(
         f"Average Latency        : "
         f"{result.average_latency_seconds:.4f}s"
     )
+
     print(
         f"Median Latency         : "
         f"{result.median_latency_seconds:.4f}s"
     )
+
     print(
         f"Average Generated      : "
         f"{result.average_generated_tokens:.2f} tokens"
     )
+
     print(
         f"Generation Throughput  : "
         f"{result.generation_tokens_per_second:.2f} tokens/s"
     )
+
     print("=" * 80)
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 
 def load_model_for_evaluation(
     model_type: str,
-) -> tuple[Any, Any, torch.device]:
+) -> tuple[Any, Any, torch.device, str, bool]:
     """
-    Load the requested model configuration.
+    Load either:
 
-    The base/LoRA distinction is currently controlled by the inference
-    configuration. The local LoRA stack is loaded through the project's
-    existing inference entry point.
+        base
+            Qwen/Qwen2.5-3B-Instruct
+
+        local-lora
+            Qwen/Qwen2.5-3B-Instruct + exported LoRA adapter
     """
 
     if model_type not in {
@@ -777,37 +981,130 @@ def load_model_for_evaluation(
             f"Unsupported model type: {model_type}"
         )
 
-    config, tokenizer, model = (
-        load_inference_stack()
+    config = _load_inference_config()
+
+    if not config["inference"]["enabled"]:
+        raise RuntimeError(
+            "Inference is disabled in the inference configuration."
+        )
+
+    _set_reproducibility_seed(
+        config["inference"]["reproducibility"]["seed"]
     )
+
+    tokenizer = _load_tokenizer(
+        config
+    )
+
+    model = _load_base_model(
+        config
+    )
+
+    adapter_used = False
+
+    if model_type == "local-lora":
+        model = _load_lora_adapter(
+            model=model,
+            config=config,
+        )
+        adapter_used = True
 
     device = next(
         model.parameters()
     ).device
 
+    base_model_name = config[
+        "model"
+    ][
+        "name"
+    ]
+
+    # Safety checks.
+    if model_type == "base":
+
+        if hasattr(
+            model,
+            "peft_config",
+        ):
+            raise RuntimeError(
+                "Base evaluation model unexpectedly contains "
+                "a PEFT configuration."
+            )
+
+    else:
+
+        if not hasattr(
+            model,
+            "peft_config",
+        ):
+            raise RuntimeError(
+                "LoRA evaluation model does not contain "
+                "a PEFT configuration."
+            )
+
+    print("=" * 80)
+    print("EVALUATION MODEL READY")
+    print("=" * 80)
+
+    print(
+        f"Model Type      : {model_type}"
+    )
+
+    print(
+        f"Base Model      : {base_model_name}"
+    )
+
+    print(
+        f"LoRA Adapter    : {adapter_used}"
+    )
+
+    print(
+        f"Device          : {device}"
+    )
+
+    print("=" * 80)
+
     return (
         model,
         tokenizer,
         device,
+        base_model_name,
+        adapter_used,
     )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    """
-    Execute the FinQA benchmark.
-    """
+    """Execute the FinQA benchmark."""
 
     args = parse_arguments()
 
-    validate_arguments(
-        args
-    )
+    validate_arguments(args)
 
     set_seed()
 
+    print("=" * 80)
+    print("FINQA EVALUATION")
+    print("=" * 80)
+
     print(
-        "Loading FinQA dataset..."
+        f"Model Type      : {args.model_type}"
     )
+
+    print(
+        f"Split           : {args.split}"
+    )
+
+    if args.max_examples is not None:
+        print(
+            f"Max Examples    : {args.max_examples}"
+        )
+
+    print("=" * 80)
 
     dataset = load_finqa_split(
         split=args.split,
@@ -815,28 +1112,23 @@ def main() -> None:
     )
 
     print(
-        f"FinQA examples: {len(dataset)}"
+        f"FinQA examples  : {len(dataset)}"
     )
 
-    print(
-        f"Loading model: {args.model_type}"
-    )
-
-    model, tokenizer, device = (
-        load_model_for_evaluation(
-            model_type=args.model_type
-        )
-    )
-
-    print(
-        f"Evaluation device: {device}"
+    (
+        model,
+        tokenizer,
+        device,
+        base_model_name,
+        adapter_used,
+    ) = load_model_for_evaluation(
+        model_type=args.model_type
     )
 
     example_results: list[ExampleResult] = []
 
-    for index, example in enumerate(
-        dataset
-    ):
+    for index, example in enumerate(dataset):
+
         result = evaluate_example(
             model=model,
             tokenizer=tokenizer,
@@ -846,40 +1138,41 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
 
-        example_results.append(
-            result
+        example_results.append(result)
+
+        current_count = len(
+            example_results
         )
 
-        if (
-            (index + 1) % 25 == 0
-            or index + 1 == len(dataset)
-        ):
-            current_exact_match = (
-                sum(
-                    item.exact_match
-                    for item in example_results
-                )
-                / len(example_results)
+        current_exact_match = (
+            sum(
+                item.exact_match
+                for item in example_results
             )
+            / current_count
+        )
 
-            current_numerical_accuracy = (
-                sum(
-                    item.numerical_accuracy
-                    for item in example_results
-                )
-                / len(example_results)
+        current_numerical_accuracy = (
+            sum(
+                item.numerical_accuracy
+                for item in example_results
             )
+            / current_count
+        )
 
-            print(
-                f"[{index + 1}/{len(dataset)}] "
-                f"EM={current_exact_match:.4%} "
-                f"NumAcc={current_numerical_accuracy:.4%}"
-            )
+        print(
+            f"[{current_count}/{len(dataset)}] "
+            f"EM={current_exact_match:.4%} "
+            f"NumAcc={current_numerical_accuracy:.4%} "
+            f"Latency={result.latency_seconds:.2f}s"
+        )
 
     benchmark_result = calculate_benchmark_metrics(
         results=example_results,
         model_type=args.model_type,
         split=args.split,
+        base_model=base_model_name,
+        adapter_used=adapter_used,
     )
 
     timestamp = datetime.now(
@@ -890,7 +1183,12 @@ def main() -> None:
 
     output_prefix = (
         args.output_prefix
-        or f"finqa_{args.model_type}_{timestamp}"
+        or (
+            f"finqa_"
+            f"{args.model_type}_"
+            f"{args.split}_"
+            f"{timestamp}"
+        )
     )
 
     predictions_path, metrics_path = save_results(
@@ -904,11 +1202,11 @@ def main() -> None:
     )
 
     print(
-        f"Predictions saved to: {predictions_path}"
+        f"Predictions saved : {predictions_path}"
     )
 
     print(
-        f"Metrics saved to: {metrics_path}"
+        f"Metrics saved     : {metrics_path}"
     )
 
 
