@@ -509,16 +509,14 @@ def _coerce_context_fields(
         "post_text": post_text,
     }
 
-
 def _truncate_text(
     text: str,
     max_tokens: int,
+    tokenizer: Any,
 ) -> str:
     """
     Truncate text using the same Qwen tokenizer mechanism
-    used by src.data.preprocessing.
-
-    This is deliberately token-based, NOT word-based.
+    used by the training preprocessing pipeline.
     """
 
     if not isinstance(text, str):
@@ -528,14 +526,6 @@ def _truncate_text(
 
     if not text:
         return ""
-
-    # Import here so normal module import remains lightweight.
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen2.5-3B-Instruct",
-        trust_remote_code=True,
-    )
 
     token_ids = tokenizer.encode(
         text,
@@ -547,11 +537,12 @@ def _truncate_text(
     return tokenizer.decode(
         token_ids,
         skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
     ).strip()
-
 
 def build_prompt(
     example: dict[str, Any],
+    tokenizer: Any,
 ) -> str:
     """
     Build the exact training-style FinQA prompt.
@@ -574,16 +565,19 @@ def build_prompt(
     background = _truncate_text(
         fields["pre_text"],
         150,
+        tokenizer,
     )
 
     financial_table = _truncate_text(
         fields["table"],
         180,
+        tokenizer,
     )
 
     additional_context = _truncate_text(
         fields["post_text"],
         40,
+        tokenizer,
     )
 
     sections: list[str] = []
@@ -626,11 +620,22 @@ def build_prompt(
         "Answer the question using only the provided financial context."
     )
 
-    return (
-        f"{system_prompt}\n\n"
-        f"{user_prompt}"
-    )
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
 
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 # ---------------------------------------------------------------------------
 # Per-example evaluation
@@ -650,7 +655,10 @@ def evaluate_example(
     question = extract_question(example)
     gold_answer = extract_gold_answer(example)
 
-    prompt = build_prompt(example)
+    prompt = build_prompt(
+        example,
+        tokenizer,
+    )
 
     start_time = time.perf_counter()
 
