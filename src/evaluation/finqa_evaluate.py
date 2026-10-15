@@ -69,6 +69,9 @@ class ExampleResult:
 
     normalized_gold: str
     normalized_prediction: str
+    numeric_examples: int
+    non_numeric_examples: int
+    non_numeric_accuracy: float
 
     gold_number: float | None
     predicted_number: float | None
@@ -94,10 +97,13 @@ class BenchmarkResult:
 
     evaluated_examples: int
 
+    numeric_examples: int
+    non_numeric_examples: int
+    non_numeric_accuracy: float
+
     exact_match: float
     numerical_accuracy: float
     invalid_prediction_rate: float
-
     average_latency_seconds: float
     median_latency_seconds: float
 
