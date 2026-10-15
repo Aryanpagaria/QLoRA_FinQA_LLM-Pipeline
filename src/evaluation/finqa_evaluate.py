@@ -281,64 +281,91 @@ def normalize_text(text: Any) -> str:
 
     return normalized.strip()
 
-
-def parse_number(
-    text: Any,
-) -> float | None:
+def extract_final_answer(text: Any) -> str:
     """
-    Extract the first numeric value from a prediction.
+    Extract a likely final answer from a generated response.
 
-    Supports:
-        - integers
-        - decimals
-        - negative numbers
-        - comma-separated numbers
-        - percentages
-        - scientific notation
+    Short answer-only outputs are preserved.
+    Long explanations require an explicit answer marker
+    or a final-answer cue; otherwise return an empty string
+    rather than guessing which number is the answer.
     """
+    if text is None:
+        return ""
 
+    text = str(text).strip()
+    if not text:
+        return ""
+
+    # Prefer the last explicit Answer: marker.
+    matches = list(
+        re.finditer(r"(?im)^\s*answer\s*:\s*", text)
+    )
+    if matches:
+        answer = text[matches[-1].end():].strip()
+        return answer.splitlines()[0].strip() if answer else ""
+
+    # Look for a sentence that explicitly states the conclusion.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    conclusion_indices = [
+        i for i, sentence in enumerate(sentences)
+        if re.search(
+            r"\b(therefore|thus|hence|final answer is|the answer is)\b",
+            sentence,
+            flags=re.IGNORECASE,
+        )
+    ]
+
+    if conclusion_indices:
+        return sentences[conclusion_indices[-1]].strip()
+
+    # Preserve concise answer-only generations, including yes/no.
+    if len(text.split()) <= 12:
+        return text
+
+    # Do not guess from an arbitrary number in a long explanation.
+    return ""
+
+
+def parse_number(text: Any) -> float | None:
+    """
+    Extract the last numeric value from an already-extracted answer.
+
+    Percentages are converted to fractions, so 14% becomes 0.14.
+    """
     if text is None:
         return None
 
     cleaned = str(text).strip()
-
     if not cleaned:
         return None
 
-    percentage_match = re.search(
-        r"[-+]?\d[\d,]*(?:\.\d+)?\s*%",
+    matches = list(re.finditer(
+        r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*%",
         cleaned,
-    )
+    ))
 
-    if percentage_match:
-        value = (
-            percentage_match.group(0)
-            .replace("%", "")
-            .replace(",", "")
-            .strip()
-        )
-
+    if matches:
+        value = matches[-1].group(0)
+        value = value.replace("%", "").replace(",", "").strip()
         try:
             return float(value) / 100.0
         except ValueError:
             return None
 
-    number_match = re.search(
-        r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)"
-        r"(?:[eE][-+]?\d+)?",
+    matches = list(re.finditer(
+        r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)(?:[eE][-+]?\d+)?",
         cleaned,
-    )
+    ))
 
-    if number_match is None:
+    if not matches:
         return None
 
-    value = number_match.group(0).replace(",", "")
-
+    value = matches[-1].group(0).replace(",", "")
     try:
         return float(value)
     except ValueError:
         return None
-
 
 def numbers_are_equivalent(
     predicted: float | None,
@@ -667,38 +694,28 @@ def evaluate_example(
     )
 
     prediction = generation.text
+    extracted_answer = extract_final_answer(prediction)
 
-    normalized_gold = normalize_text(
-        gold_answer
-    )
+    normalized_gold = normalize_text(gold_answer)
+    normalized_prediction = normalize_text(extracted_answer)
 
-    normalized_prediction = normalize_text(
-        prediction
-    )
-
-    gold_number = parse_number(
-        gold_answer
-    )
-
-    predicted_number = parse_number(
-        prediction
-    )
+    gold_number = parse_number(gold_answer)
+    predicted_number = parse_number(extracted_answer)
 
     exact_match = (
-        normalized_prediction
-        == normalized_gold
+        normalized_prediction == normalized_gold
+        and bool(normalized_prediction)
     )
 
-    numerical_accuracy = numbers_are_equivalent(
-        predicted=predicted_number,
-        gold=gold_number,
+    numerical_accuracy = (
+        gold_number is not None
+        and numbers_are_equivalent(
+            predicted=predicted_number,
+            gold=gold_number,
+        )
     )
 
-    invalid_prediction = (
-        not exact_match
-        and not numerical_accuracy
-        and predicted_number is None
-    )
+    invalid_prediction = not bool(extracted_answer)
 
     return ExampleResult(
         example_id=extract_example_id(
