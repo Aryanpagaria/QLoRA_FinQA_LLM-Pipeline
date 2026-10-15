@@ -69,9 +69,6 @@ class ExampleResult:
 
     normalized_gold: str
     normalized_prediction: str
-    numeric_examples: int
-    non_numeric_examples: int
-    non_numeric_accuracy: float
 
     gold_number: float | None
     predicted_number: float | None
@@ -83,7 +80,6 @@ class ExampleResult:
     input_tokens: int
     generated_tokens: int
     latency_seconds: float
-
 @dataclass(frozen=True)
 class BenchmarkResult:
     """Aggregate benchmark result."""
