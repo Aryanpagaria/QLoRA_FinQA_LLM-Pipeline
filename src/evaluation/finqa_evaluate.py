@@ -387,21 +387,13 @@ def extract_question(
     return question.strip()
 
 
-def extract_gold_answer(
-    example: dict[str, Any],
-) -> str:
+
+def extract_gold_answer(example: dict[str, Any]) -> str:
     """
-    Extract the human-readable FinQA answer.
-
-    IMPORTANT:
-    The current QLoRA model was trained to generate qa.answer,
-    not qa.program. Therefore the answer-generation benchmark
-    uses qa.answer as its primary target.
-
-    qa.exe_ans remains part of the source dataset and is useful
-    for future program/execution evaluation.
+    Use the human-readable answer when available.
+    Fall back to the numeric execution answer only when
+    qa.answer is missing or empty.
     """
-
     qa = example.get("qa")
 
     if not isinstance(qa, dict):
@@ -411,19 +403,18 @@ def extract_gold_answer(
 
     answer = qa.get("answer")
 
-    if answer is None:
-        raise ValueError(
-            "FinQA example does not contain qa.answer."
-        )
+    if answer is not None and str(answer).strip():
+        return str(answer).strip()
 
-    answer = str(answer).strip()
+    execution_answer = qa.get("exe_ans")
 
-    if not answer:
-        raise ValueError(
-            "FinQA example contains an empty qa.answer."
-        )
+    if execution_answer is not None and str(execution_answer).strip():
+        return str(execution_answer).strip()
 
-    return answer
+    raise ValueError(
+        "FinQA example has neither a usable qa.answer "
+        "nor a usable qa.exe_ans."
+    )
 
 
 def extract_example_id(
