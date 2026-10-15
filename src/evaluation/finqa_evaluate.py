@@ -86,33 +86,28 @@ class ExampleResult:
 
 
 @dataclass(frozen=True)
-class BenchmarkResult:
-    """Aggregate benchmark result."""
+class ExampleResult:
+    """Evaluation result for one FinQA example."""
 
-    benchmark: str
-    split: str
-    model_type: str
-    base_model: str
-    adapter_used: bool
+    example_id: str
+    question: str
+    gold_answer: str
+    prediction: str
 
-    evaluated_examples: int
+    normalized_gold: str
+    normalized_prediction: str
 
-    numeric_examples: int
-    non_numeric_examples: int
-    non_numeric_accuracy: float
+    gold_number: float | None
+    predicted_number: float | None
 
-    exact_match: float
-    numerical_accuracy: float
-    invalid_prediction_rate: float
+    exact_match: bool
+    numerical_accuracy: bool
+    invalid_prediction: bool
 
-    average_latency_seconds: float
-    median_latency_seconds: float
+    input_tokens: int
+    generated_tokens: int
+    latency_seconds: float
 
-    total_generated_tokens: int
-    average_generated_tokens: float
-    generation_tokens_per_second: float
-
-    evaluation_timestamp_utc: str
 
 
 # ---------------------------------------------------------------------------
