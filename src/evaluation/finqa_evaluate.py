@@ -104,6 +104,7 @@ class BenchmarkResult:
     exact_match: float
     numerical_accuracy: float
     invalid_prediction_rate: float
+
     average_latency_seconds: float
     median_latency_seconds: float
 
