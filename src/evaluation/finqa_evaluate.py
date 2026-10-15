@@ -750,7 +750,7 @@ def calculate_benchmark_metrics(
     base_model: str,
     adapter_used: bool,
 ) -> BenchmarkResult:
-    """Calculate aggregate benchmark metrics."""
+    """Calculate aggregate metrics with explicit denominators."""
 
     if not results:
         raise RuntimeError(
@@ -759,29 +759,45 @@ def calculate_benchmark_metrics(
 
     count = len(results)
 
-    exact_match_count = sum(
-        result.exact_match
-        for result in results
+    numeric_results = [
+        result for result in results
+        if result.gold_number is not None
+    ]
+
+    non_numeric_results = [
+        result for result in results
+        if result.gold_number is None
+    ]
+
+    exact_match = sum(
+        result.exact_match for result in results
+    ) / count
+
+    numerical_accuracy = (
+        sum(result.numerical_accuracy for result in numeric_results)
+        / len(numeric_results)
+        if numeric_results else 0.0
     )
 
-    numerical_accuracy_count = sum(
-        result.numerical_accuracy
-        for result in results
+    non_numeric_accuracy = (
+        sum(
+            result.normalized_prediction == result.normalized_gold
+            and bool(result.normalized_prediction)
+            for result in non_numeric_results
+        ) / len(non_numeric_results)
+        if non_numeric_results else 0.0
     )
 
-    invalid_prediction_count = sum(
-        result.invalid_prediction
-        for result in results
-    )
+    invalid_prediction_rate = sum(
+        result.invalid_prediction for result in results
+    ) / count
 
     latencies = [
-        result.latency_seconds
-        for result in results
+        result.latency_seconds for result in results
     ]
 
     total_generated_tokens = sum(
-        result.generated_tokens
-        for result in results
+        result.generated_tokens for result in results
     )
 
     total_latency = sum(latencies)
@@ -793,37 +809,23 @@ def calculate_benchmark_metrics(
         base_model=base_model,
         adapter_used=adapter_used,
         evaluated_examples=count,
-        exact_match=(
-            exact_match_count / count
-        ),
-        numerical_accuracy=(
-            numerical_accuracy_count / count
-        ),
-        invalid_prediction_rate=(
-            invalid_prediction_count / count
-        ),
-        average_latency_seconds=(
-            total_latency / count
-        ),
-        median_latency_seconds=statistics.median(
-            latencies
-        ),
-        total_generated_tokens=(
-            total_generated_tokens
-        ),
-        average_generated_tokens=(
-            total_generated_tokens / count
-        ),
+        numeric_examples=len(numeric_results),
+        non_numeric_examples=len(non_numeric_results),
+        non_numeric_accuracy=non_numeric_accuracy,
+        exact_match=exact_match,
+        numerical_accuracy=numerical_accuracy,
+        invalid_prediction_rate=invalid_prediction_rate,
+        average_latency_seconds=total_latency / count,
+        median_latency_seconds=statistics.median(latencies),
+        total_generated_tokens=total_generated_tokens,
+        average_generated_tokens=total_generated_tokens / count,
         generation_tokens_per_second=(
             total_generated_tokens / total_latency
-            if total_latency > 0
-            else 0.0
+            if total_latency > 0 else 0.0
         ),
-        evaluation_timestamp_utc=(
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        ),
+        evaluation_timestamp_utc=datetime.now(
+            timezone.utc
+        ).isoformat(),
     )
 
 
@@ -965,6 +967,15 @@ def print_summary(
     print(
         f"Generation Throughput  : "
         f"{result.generation_tokens_per_second:.2f} tokens/s"
+    )
+    print(
+        f"Numeric Examples       : {result.numeric_examples}"
+    )
+    print(
+        f"Non-numeric Examples   : {result.non_numeric_examples}"
+    )
+    print(
+        f"Non-numeric Accuracy   : {result.non_numeric_accuracy:.4%}"
     )
 
     print("=" * 80)
